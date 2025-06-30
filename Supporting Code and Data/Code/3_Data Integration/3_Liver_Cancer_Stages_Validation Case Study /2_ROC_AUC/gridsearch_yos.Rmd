@@ -1,0 +1,234 @@
+---
+title: "Lasso - Liver"
+author: "Tirdod Behbehani, Elisa Scocco,Iñigo Exposito"
+date: "2025-04-19"
+output: html_document
+---
+
+
+
+```{r}
+#––– PACKAGES –––
+library(readr)
+library(glmnet)
+library(pROC)
+library(caret)
+library(ParBayesianOptimization)
+library(dplyr)
+```
+
+
+```{r}
+#––– 0) LOAD + PREP DATA –––
+gene_expression_stage_34 <- read_csv("/Users/usuario/OneDrive/Desktop/Thesis/personal_files/stages/gene_expression_stage_34.csv") %>%
+  select(-Is_stage_34, -id)
+
+# Outcome and predictor matrix
+y <- gene_expression_stage_34$OS
+X <- gene_expression_stage_34 %>% select(-OS)
+
+# Standardize features
+X <- scale(X) %>% as.matrix()
+predictor_names <- colnames(X)
+
+# Load the coefficients from Adaptive Ridge and remove first uninformative 25%
+coef_enet <- read_csv("/Users/usuario/OneDrive/Desktop/Thesis/personal_files/stages/coef_stage12/OS_coefficients_Elastic_Net.csv")
+
+# Rank by absolute value of coefficients
+coef_enet <- coef_enet %>%
+  mutate(abs_value = abs(value)) %>%
+  arrange(desc(abs_value)) %>%
+  mutate(selected = 1) %>%
+  select(Variable, selected)
+
+# Build z_j: binary vector of selected features
+p <- ncol(X)
+z_j <- integer(p); names(z_j) <- predictor_names
+z_j[ intersect(predictor_names, coef_enet$Variable) ] <-
+  coef_enet$selected[ match(intersect(predictor_names, coef_enet$Variable),
+                            coef_enet$Variable) ]
+
+```
+
+
+```{r}
+set.seed(236)
+n <- nrow(X)
+train_idx <- sample(1:n, size = floor(0.8 * n))
+X_train <- X[train_idx, ]
+X_test  <- X[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+
+z_j_train <- z_j  # same features for both train/test
+
+```
+
+```{r}
+#––– 1) Pre‐define CV folds once –––
+set.seed(123)
+k     <- 10
+folds <- sample(rep(1:k, length.out = nrow(X_train)))
+```
+
+
+```{r}
+
+#––– 2) Objective: 3‐step integrative LASSO + CV‐AUC –––
+lasso_cv_auc_train <- function(theta0, theta1) {
+
+  lambda_j <- exp(theta0 + theta1 * z_j_train)
+  W <- sweep(X_train, 2, lambda_j, FUN = "/")
+  
+  aucs <- numeric(k)
+  for (i in seq_len(k)) {
+    tr <- which(folds != i); te <- which(folds == i)
+    W_tr <- W[tr, , drop=FALSE]; y_tr <- y_train[tr]
+    W_te <- W[te, , drop=FALSE]; y_te <- y_train[te]
+    
+    fit <- glmnet(x = W_tr, y = y_tr,
+                  family = "binomial",
+                  alpha = 1, lambda = 1,
+                  intercept = TRUE,
+                  standardize = FALSE)
+    
+    coefs <- as.numeric(coef(fit, s = 1))
+    intercept <- coefs[1]
+    beta_tilde <- coefs[-1]
+    
+    linpred_vec <- as.numeric(intercept + W_te %*% beta_tilde)
+    prob_te <- 1 / (1 + exp(-linpred_vec))
+    
+    aucs[i] <- auc(roc(y_te, prob_te, quiet = TRUE))
+  }
+  
+  mean(aucs)
+}
+```
+
+
+```{r}
+
+theta0_vals <- seq(-5, 0, by = 0.25)
+theta1_vals <- seq(-2, 2, by = 0.25) 
+
+grid <- expand.grid(theta0 = theta0_vals, theta1 = theta1_vals)
+
+
+grid <- expand.grid(theta0 = theta0_vals, theta1 = theta1_vals)
+
+```
+
+```{r}
+cv_results <- grid %>%
+  rowwise() %>%
+  mutate(mean_auc = lasso_cv_auc_train(theta0, theta1)) %>%
+  ungroup()
+
+```
+
+```{r}
+best_result <- cv_results %>% filter(mean_auc == max(mean_auc))
+
+print(best_result)
+
+```
+
+```{r}
+theta0_opt <- best_result$theta0
+theta1_opt <- best_result$theta1
+
+```
+
+```{r}
+theta0_opt
+theta1_opt
+```
+
+```{r}
+#––– 3) Compare test AUC for theta1 = 0 vs theta1 = theta1_opt –––
+
+# A. Test AUC when theta1 = 0 (global penalty)
+lambda_j_global <- exp(theta0_opt + 0 * z_j_train)
+W_train_global <- sweep(X_train, 2, lambda_j_global, FUN = "/")
+W_test_global  <- sweep(X_test, 2, lambda_j_global, FUN = "/")
+
+fit_global <- glmnet(x = W_train_global, y = y_train,
+                     family = "binomial",
+                     alpha = 1, lambda = 1,
+                     intercept = TRUE,
+                     standardize = FALSE)
+
+coefs_global <- as.numeric(coef(fit_global, s = 1))
+intercept_global <- coefs_global[1]
+beta_global <- coefs_global[-1]
+
+linpred_global <- as.numeric(intercept_global + W_test_global %*% beta_global)
+prob_test_global <- 1 / (1 + exp(-linpred_global))
+
+test_auc_global <- auc(roc(y_test, prob_test_global))
+cat("Test AUC (theta1 = 0):", round(test_auc_global, 4), "\n")
+
+
+# B. Test AUC when theta1 = theta1_opt (differential penalties)
+lambda_j_opt <- exp(theta0_opt + theta1_opt * z_j_train)
+W_train_opt <- sweep(X_train, 2, lambda_j_opt, FUN = "/")
+W_test_opt  <- sweep(X_test, 2, lambda_j_opt, FUN = "/")
+
+fit_opt <- glmnet(x = W_train_opt, y = y_train,
+                  family = "binomial",
+                  alpha = 1, lambda = 1,
+                  intercept = TRUE,
+                  standardize = FALSE)
+
+coefs_opt <- as.numeric(coef(fit_opt, s = 1))
+intercept_opt <- coefs_opt[1]
+beta_opt <- coefs_opt[-1]
+
+linpred_opt <- as.numeric(intercept_opt + W_test_opt %*% beta_opt)
+prob_test_opt <- 1 / (1 + exp(-linpred_opt))
+
+test_auc_opt <- auc(roc(y_test, prob_test_opt))
+cat("Test AUC (theta1 = ", theta1_opt, "):", round(test_auc_opt, 4), "\n")
+
+# Optional: report AUC improvement
+delta_auc <- test_auc_opt - test_auc_global
+cat("AUC Improvement:", round(delta_auc, 4), "\n")
+
+```
+
+
+```{r}
+# Associate names to final model coefficients (theta1 = theta1_opt)
+predictor_names <- colnames(X_train)
+names(beta_opt) <- predictor_names
+
+# Extract non-zero coefficients
+selected_betas <- beta_opt[beta_opt != 0]
+print(selected_betas)
+
+```
+
+
+#comparing genes selected from std lasso 
+
+```{r}
+coef_enet
+```
+
+```{r}
+# Genes selected by Adaptive Ridge on breast cancer (prior)
+prior_genes <- coef_enet$Variable
+
+# Genes selected by the current LASSO model (non-zero coefficients)
+selected_genes <- names(selected_betas)
+
+# Intersect to find common genes
+common_genes <- intersect(prior_genes, selected_genes)
+
+# Print results
+cat("Number of common genes:", length(common_genes), "\n")
+print(common_genes)
+
+```
+

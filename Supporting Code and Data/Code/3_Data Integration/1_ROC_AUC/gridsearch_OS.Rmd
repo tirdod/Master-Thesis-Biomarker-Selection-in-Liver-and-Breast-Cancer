@@ -1,0 +1,264 @@
+---
+title: "Lasso - Liver"
+author: "Tirdod Behbehani, Elisa Scocco,Iñigo Exposito"
+date: "2025-04-19"
+output: html_document
+---
+
+
+```{r}
+#––– PACKAGES –––
+library(readr)
+library(glmnet)
+library(pROC)
+library(caret)
+library(ParBayesianOptimization)
+library(dplyr)
+```
+
+
+```{r}
+#––– 0) LOAD + PREP DATA –––
+gene_expression_stage_34 <- read_csv("/Users/usuario/OneDrive/Desktop/Thesis/personal_files/Liver_final/gene_expression_only_liver_final.csv") %>%
+  select(-Is_stage_34, -id)
+
+# Outcome and predictor matrix
+y <- gene_expression_stage_34$OS
+X <- gene_expression_stage_34 %>% select(-OS)
+
+# Standardize features
+X <- scale(X) %>% as.matrix()
+predictor_names <- colnames(X)
+
+# Load the coefficients from Adaptive Ridge and remove first uninformative 25%
+coef_enet <- read_csv("/Users/usuario/OneDrive/Desktop/Thesis/personal_files/breastselected/OS_coefficients_adaptive_Ridge.csv")
+
+# Rank by absolute value of coefficients
+coef_enet <- coef_enet %>%
+  mutate(abs_value = abs(value)) %>%
+  arrange(desc(abs_value)) %>%
+  # Keep only the top 75% of genes
+  slice(1:floor(0.75 * n())) %>%
+  mutate(selected = 1) %>%
+  select(Variable, selected)
+
+# Build z_j: binary vector of selected features
+p <- ncol(X)
+z_j <- integer(p); names(z_j) <- predictor_names
+z_j[ intersect(predictor_names, coef_enet$Variable) ] <-
+  coef_enet$selected[ match(intersect(predictor_names, coef_enet$Variable),
+                            coef_enet$Variable) ]
+
+```
+
+
+```{r}
+set.seed(236)
+n <- nrow(X)
+train_idx <- sample(1:n, size = floor(0.8 * n))
+X_train <- X[train_idx, ]
+X_test  <- X[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+
+z_j_train <- z_j  # same features for both train/test
+
+```
+
+```{r}
+#––– 1) Pre‐define CV folds once –––
+set.seed(123)
+k     <- 10
+folds <- sample(rep(1:k, length.out = nrow(X_train)))
+```
+
+
+```{r}
+
+#––– 2) Objective: 3‐step integrative LASSO + CV‐AUC –––
+lasso_cv_auc_train <- function(theta0, theta1) {
+
+  lambda_j <- exp(theta0 + theta1 * z_j_train)
+  W <- sweep(X_train, 2, lambda_j, FUN = "/")
+  
+  aucs <- numeric(k)
+  for (i in seq_len(k)) {
+    tr <- which(folds != i); te <- which(folds == i)
+    W_tr <- W[tr, , drop=FALSE]; y_tr <- y_train[tr]
+    W_te <- W[te, , drop=FALSE]; y_te <- y_train[te]
+    
+    fit <- glmnet(x = W_tr, y = y_tr,
+                  family = "binomial",
+                  alpha = 1, lambda = 1,
+                  intercept = TRUE,
+                  standardize = FALSE)
+    
+    coefs <- as.numeric(coef(fit, s = 1))
+    intercept <- coefs[1]
+    beta_tilde <- coefs[-1]
+    
+    linpred_vec <- as.numeric(intercept + W_te %*% beta_tilde)
+    prob_te <- 1 / (1 + exp(-linpred_vec))
+    
+    aucs[i] <- auc(roc(y_te, prob_te, quiet = TRUE))
+  }
+  
+  mean(aucs)
+}
+```
+
+
+```{r}
+
+theta0_vals <- seq(-5, 0, by = 0.25)
+theta1_vals <- seq(-2, 2, by = 0.25) 
+
+grid <- expand.grid(theta0 = theta0_vals, theta1 = theta1_vals)
+
+
+grid <- expand.grid(theta0 = theta0_vals, theta1 = theta1_vals)
+
+```
+
+```{r}
+cv_results <- grid %>%
+  rowwise() %>%
+  mutate(mean_auc = lasso_cv_auc_train(theta0, theta1)) %>%
+  ungroup()
+
+```
+
+```{r}
+best_result <- cv_results %>% filter(mean_auc == max(mean_auc))
+
+print(best_result)
+
+```
+
+```{r}
+theta0_opt <- best_result$theta0
+theta1_opt <- best_result$theta1
+
+```
+
+```{r}
+theta0_opt
+theta1_opt
+```
+
+```{r}
+#––– 3) Compare test AUC for theta1 = 0 vs theta1 = theta1_opt –––
+
+# A. Test AUC when theta1 = 0 (global penalty)
+lambda_j_global <- exp(theta0_opt + 0 * z_j_train)
+W_train_global <- sweep(X_train, 2, lambda_j_global, FUN = "/")
+W_test_global  <- sweep(X_test, 2, lambda_j_global, FUN = "/")
+
+fit_global <- glmnet(x = W_train_global, y = y_train,
+                     family = "binomial",
+                     alpha = 1, lambda = 1,
+                     intercept = TRUE,
+                     standardize = FALSE)
+
+coefs_global <- as.numeric(coef(fit_global, s = 1))
+intercept_global <- coefs_global[1]
+beta_global <- coefs_global[-1]
+
+linpred_global <- as.numeric(intercept_global + W_test_global %*% beta_global)
+prob_test_global <- 1 / (1 + exp(-linpred_global))
+
+test_auc_global <- auc(roc(y_test, prob_test_global))
+cat("Test AUC (theta1 = 0):", round(test_auc_global, 4), "\n")
+
+
+# B. Test AUC when theta1 = theta1_opt (differential penalties)
+lambda_j_opt <- exp(theta0_opt + theta1_opt * z_j_train)
+W_train_opt <- sweep(X_train, 2, lambda_j_opt, FUN = "/")
+W_test_opt  <- sweep(X_test, 2, lambda_j_opt, FUN = "/")
+
+fit_opt <- glmnet(x = W_train_opt, y = y_train,
+                  family = "binomial",
+                  alpha = 1, lambda = 1,
+                  intercept = TRUE,
+                  standardize = FALSE)
+
+coefs_opt <- as.numeric(coef(fit_opt, s = 1))
+intercept_opt <- coefs_opt[1]
+beta_opt <- coefs_opt[-1]
+
+linpred_opt <- as.numeric(intercept_opt + W_test_opt %*% beta_opt)
+prob_test_opt <- 1 / (1 + exp(-linpred_opt))
+
+test_auc_opt <- auc(roc(y_test, prob_test_opt))
+cat("Test AUC (theta1 = ", theta1_opt, "):", round(test_auc_opt, 4), "\n")
+
+# Optional: report AUC improvement
+delta_auc <- test_auc_opt - test_auc_global
+cat("AUC Improvement:", round(delta_auc, 4), "\n")
+
+```
+
+
+```{r}
+# Associate names to final model coefficients (theta1 = theta1_opt)
+predictor_names <- colnames(X_train)
+names(beta_opt) <- predictor_names
+
+# Extract non-zero coefficients
+selected_betas <- beta_opt[beta_opt != 0]
+print(selected_betas)
+
+```
+
+
+#comparing genes selected from std lasso 
+
+
+```{r}
+genes_list_1 <- c(
+  "ENSG00000068985", "ENSG00000136371", "ENSG00000162383", "ENSG00000174326",
+  "ENSG00000174358", "ENSG00000184350", "ENSG00000197245", "ENSG00000221598",
+  "ENSG00000226372", "ENSG00000226468", "ENSG00000233337", "ENSG00000236816",
+  "ENSG00000237453", "ENSG00000243694", "ENSG00000251015", "ENSG00000251177",
+  "ENSG00000266373", "ENSG00000268883", "ENSG00000271119", "ENSG00000271715",
+  "ENSG00000279307"
+)
+
+genes_list_2 <- c(
+  "ENSG00000002726", "ENSG00000004846", "ENSG00000006016", "ENSG00000100151", "ENSG00000105135",
+  "ENSG00000105695", "ENSG00000112214", "ENSG00000115263", "ENSG00000116147", "ENSG00000125999",
+  "ENSG00000135750", "ENSG00000136371", "ENSG00000137976", "ENSG00000140873", "ENSG00000144362",
+  "ENSG00000146285", "ENSG00000149489", "ENSG00000153303", "ENSG00000156885", "ENSG00000157152",
+  "ENSG00000159763", "ENSG00000174326", "ENSG00000175600", "ENSG00000179131", "ENSG00000183434",
+  "ENSG00000183798", "ENSG00000184350", "ENSG00000184601", "ENSG00000185053", "ENSG00000187550",
+  "ENSG00000196091", "ENSG00000196932", "ENSG00000197181", "ENSG00000197245", "ENSG00000197582",
+  "ENSG00000198125", "ENSG00000199161", "ENSG00000199509", "ENSG00000200816", "ENSG00000204025",
+  "ENSG00000206815", "ENSG00000207307", "ENSG00000211448", "ENSG00000211800", "ENSG00000213069",
+  "ENSG00000214846", "ENSG00000215795", "ENSG00000218617", "ENSG00000221598", "ENSG00000223313",
+  "ENSG00000224093", "ENSG00000224097", "ENSG00000224387", "ENSG00000224592", "ENSG00000225026",
+  "ENSG00000225180", "ENSG00000225183", "ENSG00000226372", "ENSG00000228007", "ENSG00000229589",
+  "ENSG00000229758", "ENSG00000229983", "ENSG00000230478", "ENSG00000230635", "ENSG00000231103",
+  "ENSG00000231503", "ENSG00000231948", "ENSG00000233064", "ENSG00000233337", "ENSG00000233415",
+  "ENSG00000237453", "ENSG00000237767", "ENSG00000238072", "ENSG00000238317", "ENSG00000238741",
+  "ENSG00000239804", "ENSG00000239899", "ENSG00000239998", "ENSG00000240457", "ENSG00000243694",
+  "ENSG00000244604", "ENSG00000249791", "ENSG00000250068", "ENSG00000251015", "ENSG00000251226",
+  "ENSG00000251271", "ENSG00000251991", "ENSG00000255422", "ENSG00000255569", "ENSG00000255980",
+  "ENSG00000259665", "ENSG00000260420", "ENSG00000263033", "ENSG00000264940", "ENSG00000265728",
+  "ENSG00000266126", "ENSG00000266373", "ENSG00000266640", "ENSG00000267452", "ENSG00000268883",
+  "ENSG00000269190", "ENSG00000269949", "ENSG00000270372", "ENSG00000270614", "ENSG00000271361",
+  "ENSG00000271715", "ENSG00000272343", "ENSG00000273328", "ENSG00000273972", "ENSG00000275091",
+  "ENSG00000275212", "ENSG00000276174", "ENSG00000276436", "ENSG00000277235", "ENSG00000278418",
+  "ENSG00000279307", "ENSG00000279406", "ENSG00000279724", "ENSG00000283057", "ENSG00000283498",
+  "ENSG00000283648", "ENSG00000283672", "ENSG00000283682", "ENSG00000286523", "ENSG00000287486"
+)
+
+```
+
+```{r}
+common_genes <- intersect(genes_list_1, genes_list_2)
+print(common_genes)
+
+```
+
+
+

@@ -1,0 +1,620 @@
+---
+title: "Lasso - Liver"
+author: "Tirdod Behbehani, Elisa Scocco,Iñigo Exposito"
+date: "2025-04-19"
+output: html_document
+---
+```{r}
+#load packages
+library(readr)
+library(glmnet)
+library(pROC)
+library(caret)
+```
+
+```{r}
+#load datasets
+#gene_expression_ <- read_csv("/Users/inigo/Downloads/R/gene_expression_only_t_final.csv")
+#gene_expression_liver <- read_csv("~/Desktop/BSE/Term #3/Thesis/master_thesis_git/liver cancer/gene_expression_only_liver_final.csv"
+#)
+gene_expression_liver <- read_csv("/Users/inigo/Downloads/gene_expression_only_liver_final.csv")
+```
+
+
+```{r}
+# we drop the column Is_stage_34 from the regression
+gene_expression_liver <- gene_expression_liver[ , !(names(gene_expression_liver) %in% c("Is_stage_34", "id"))]
+
+```
+
+```{r}
+# Extract target variable
+y_OS <- gene_expression_liver[["OS"]]
+
+```
+
+
+```{r}
+#Standarize the gene expression
+gene_expression_liver <- as.data.frame(scale(gene_expression_liver))
+```
+
+
+#Prepare test and train sets
+```{r}
+# Split data into training and test sets (80/20)
+set.seed(236)
+X <- as.matrix(gene_expression_liver[ , names(gene_expression_liver) != "OS"])
+n <- nrow(X)
+y<-factor(y_OS, levels = c(0, 1))
+train_idx <- sample(1:n, size = floor(0.8 * n))
+X_train <- X[train_idx, ]
+X_test  <- X[-train_idx, ]
+y_train <- y[train_idx]
+y_test  <- y[-train_idx]
+```
+
+
+#LASSO FOR Y_OS
+
+```{r}
+#LASSO FOR Y_OS
+
+### Fit Lasso with 3-fold cross-validation (on training set only)
+set.seed(236)
+cv_lasso <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1, type.measure = "auc",nfolds=10,nlambda = 200)
+lambda_lasso <- cv_lasso$lambda.min
+```
+
+
+```{r}
+# Extract non-zero coefficients
+coef_lasso <- coef(cv_lasso, s = lambda_lasso)
+coef_df <- as.data.frame(as.matrix(coef_lasso))
+colnames(coef_df)[1] <- "value"
+coef_df$Variable <- rownames(coef_df)
+
+# Non-zero coefficients, excluding intercept
+coef_df_non_zero <- subset(coef_df, value != 0 & Variable != "(Intercept)")
+
+# How many and what are they
+num_selected <- nrow(coef_df_non_zero)
+cat("Lasso selected", num_selected, "genes with non-zero coefficients.\n")
+print(coef_df_non_zero)
+```
+
+
+```{r}
+###  Predict probabilities on the test set
+fitted_probs_test <- as.vector(predict(cv_lasso, newx = X_test, s = lambda_lasso, type = "response"))
+
+### ROC curve and AUC (on test set)
+roc_lasso <- roc(y_test, fitted_probs_test, positive = "1", quiet = TRUE)
+plot(roc_lasso, 
+     legacy.axes = TRUE,  
+     print.thres = TRUE, 
+     print.thres.col = "darkgreen", 
+     main = "ROC - Lasso (Test Set)")
+
+cat("Lasso Test AUC:", round(auc(roc_lasso), 3), "\n")
+
+```
+
+```{r}
+# Select best threshold (maximizes sensitivity + specificity)
+threshold_lasso <- coords(roc_lasso, "best", ret = "threshold")[[1]]
+cat("Automatically selected threshold:", round(threshold_lasso, 4), "\n")
+
+#Predict classes using that threshold
+pred_class_lasso <- ifelse(fitted_probs_test >= threshold_lasso, 1, 0)
+
+#Confusion matrix
+conf_matrix_lasso <- table(Predicted = pred_class_lasso, Actual = y_test)
+cat("\nConfusion Matrix:\n")
+print(conf_matrix_lasso)
+
+#Row-wise proportions
+cat("\nRow-wise proportions:\n")
+print(round(prop.table(conf_matrix_lasso, 1), 3))
+
+#Metrics
+TP <- sum(pred_class_lasso == 1 & y_test == 1)
+TN <- sum(pred_class_lasso == 0 & y_test == 0)
+FP <- sum(pred_class_lasso == 1 & y_test == 0)
+FN <- sum(pred_class_lasso == 0 & y_test == 1)
+
+precision <- TP / (TP + FP)
+recall <- TP / (TP + FN)
+f1 <- 2 * precision * recall / (precision + recall)
+specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA)
+accuracy <- mean(pred_class_lasso == y_test)
+
+cat("\nPerformance metrics:\n")
+cat("Accuracy:", round(accuracy, 3), "\n")
+cat("Precision:", round(precision, 3), "\n")
+cat("Recall (Sensitivity):", round(recall, 3), "\n")
+cat("Specificity:", round(specificity, 3), "\n")
+cat("F1-score:", round(f1, 3), "\n")
+```
+
+
+
+#ADPATIVE LASSO FOR Y_OS
+
+```{r}
+#ADPATIVE LASSO FOR Y_OS
+set.seed(236)
+# Recall Initial Lasso
+initial_coefs <- as.vector(coef(cv_lasso, s = lambda_lasso))[-1]  # drop intercept
+
+#Select variables with non-zero coefficients
+non_zero_idx <- which(initial_coefs != 0)
+X_train_selected <- X_train[, non_zero_idx, drop = FALSE]
+X_test_selected  <- X_test[, non_zero_idx, drop = FALSE]
+
+# Define adaptive weights only for selected variables
+adaptive_weights <- 1 / abs(initial_coefs[non_zero_idx])
+
+# Fit Adaptive Lasso on reduced design matrix
+cv_adaptive_lasso <- cv.glmnet(
+  X_train_selected, y_train,
+  family = "binomial",
+  alpha = 1,
+  type.measure = "auc",
+  penalty.factor = adaptive_weights,
+  nfolds = 10
+)
+lambda_adapt <- cv_adaptive_lasso$lambda.min
+
+#  Get non-zero coefficients
+coef_adapt <- coef(cv_adaptive_lasso, s = lambda_adapt)
+coef_df_adapt <- as.data.frame(as.matrix(coef_adapt))
+colnames(coef_df_adapt)[1] <- "value"
+coef_df_adapt$Variable <- rownames(coef_df_adapt)
+
+coef_df_adapt_non_zero <- subset(coef_df_adapt, value != 0 & Variable != "(Intercept)")
+
+cat("Adaptive Lasso selected", nrow(coef_df_adapt_non_zero), "genes (from post-selection).\n")
+print(coef_df_adapt_non_zero)
+
+```
+
+
+```{r}
+# Predict probabilities on reduced test set
+fitted_probs_adapt <- as.vector(predict(cv_adaptive_lasso, newx = X_test_selected, s = lambda_adapt, type = "response"))
+
+# ROC Curve and AUC
+roc_adapt <- roc(y_test, fitted_probs_adapt, positive = "1", quiet = TRUE)
+plot(roc_adapt,legacy.axes = TRUE, print.thres = TRUE, print.thres.col = "darkgreen", main = "ROC - Adaptive Lasso (Post-selection)")
+cat("Adaptive Lasso AUC:", round(auc(roc_adapt), 3), "\n")
+
+```
+
+```{r}
+# Select best threshold from ROC (Youden index)
+threshold_adapt <- coords(roc_adapt, "best", ret = "threshold")[[1]]
+cat("Automatically selected threshold:", round(threshold_adapt, 4), "\n")
+
+#Predict classes
+pred_adapt <- ifelse(fitted_probs_adapt >= threshold_adapt, 1, 0)
+
+#Confusion matrix
+conf_adapt <- table(Predicted = pred_adapt, Actual = y_test)
+cat("\nConfusion Matrix:\n")
+print(conf_adapt)
+
+# Row-wise proportions
+cat("\nRow-wise proportions:\n")
+print(round(prop.table(conf_adapt, 1), 3))
+
+# Compute metrics manually
+TP <- sum(pred_adapt == 1 & y_test == 1)
+TN <- sum(pred_adapt == 0 & y_test == 0)
+FP <- sum(pred_adapt == 1 & y_test == 0)
+FN <- sum(pred_adapt == 0 & y_test == 1)
+
+# Handle zero-division cases
+precision <- ifelse((TP + FP) > 0, TP / (TP + FP), NA)
+recall <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
+specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA)
+f1 <- ifelse((precision + recall) > 0, 2 * precision * recall / (precision + recall), NA)
+accuracy <- mean(pred_adapt == y_test)
+
+# Print metrics
+cat("\nPerformance metrics:\n")
+cat("Accuracy   :", round(accuracy, 3), "\n")
+cat("Precision  :", round(precision, 3), "\n")
+cat("Recall     :", round(recall, 3), "\n")
+cat("Specificity:", round(specificity, 3), "\n")
+cat("F1-score   :", round(f1, 3), "\n")
+
+```
+
+
+#ELASTIC NET FOR Y_OS
+
+```{r}
+#ELASTIC NET FOR Y_OS
+set.seed(236)
+###Fit Elastic Net with CV 
+cv_enet <- cv.glmnet(
+  X_train, y_train,
+  family = "binomial",
+  alpha = 0.5,               # Elastic Net (L1 + L2)
+  type.measure = "auc",
+  nfolds = 10,
+  nlambda = 200
+)
+lambda_enet <- cv_enet$lambda.min
+cat("Best lambda (Elastic Net):", lambda_enet, "\n")
+
+#Get non-zero coefficients from Elastic Net
+coef_enet <- coef(cv_enet, s = lambda_enet)
+
+# Convert to data frame
+coef_df_enet <- as.data.frame(as.matrix(coef_enet))
+colnames(coef_df_enet)[1] <- "value"  # rename column
+coef_df_enet$Variable <- rownames(coef_df_enet)
+
+# Filter out zero coefficients and the intercept
+coef_df_enet_non_zero <- subset(coef_df_enet, value != 0 & Variable != "(Intercept)")
+
+# Report number of selected genes and show them
+cat("Elastic Net selected", nrow(coef_df_enet_non_zero), "genes with non-zero coefficients.\n")
+print(coef_df_enet_non_zero)
+
+```
+
+
+```{r}
+### STEP 3: Predict probabilities on test set
+fitted_probs_enet <- as.vector(predict(cv_enet, newx = X_test, s = lambda_enet, type = "response"))
+
+### STEP 4: ROC Curve and AUC
+roc_enet <- roc(y_test, fitted_probs_enet, positive = "1", quiet = TRUE)
+plot(roc_enet,legacy.axes = TRUE,
+     print.thres = TRUE,
+     print.thres.col = "blue",
+     main = "ROC - Elastic Net")
+cat("Elastic Net AUC (test set):", round(auc(roc_enet), 3), "\n")
+```
+
+```{r}
+# STEP 5: Compute ROC and select the best threshold
+roc_enet <- roc(y_test, fitted_probs_enet, positive = "1", quiet = TRUE)
+threshold_enet <- coords(roc_enet, "best", ret = "threshold")[[1]]
+cat("Automatically selected threshold:", round(threshold_enet, 4), "\n")
+
+# STEP 6: Predict classes using the best threshold
+pred_enet <- ifelse(fitted_probs_enet >= threshold_enet, 1, 0)
+
+# STEP 7: Confusion matrix
+conf_enet <- table(Predicted = pred_enet, Actual = y_test)
+cat("\nConfusion Matrix:\n")
+print(conf_enet)
+
+# Row-wise proportions
+cat("\nRow-wise proportions:\n")
+print(round(prop.table(conf_enet, 1), 3))
+
+# STEP 8: Compute detailed performance metrics
+TP <- sum(pred_enet == 1 & y_test == 1)
+TN <- sum(pred_enet == 0 & y_test == 0)
+FP <- sum(pred_enet == 1 & y_test == 0)
+FN <- sum(pred_enet == 0 & y_test == 1)
+
+precision   <- ifelse((TP + FP) > 0, TP / (TP + FP), NA)
+recall      <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
+specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA)
+f1_score    <- ifelse((precision + recall) > 0, 2 * precision * recall / (precision + recall), NA)
+accuracy    <- mean(pred_enet == y_test)
+
+# STEP 9: Print metrics
+cat("\nPerformance metrics:\n")
+cat("Accuracy   :", round(accuracy, 3), "\n")
+cat("Precision  :", round(precision, 3), "\n")
+cat("Recall     :", round(recall, 3), "\n")
+cat("Specificity:", round(specificity, 3), "\n")
+cat("F1-score   :", round(f1_score, 3), "\n")
+
+```
+
+
+
+
+# Adaptive with elastic net
+
+
+
+```{r}
+
+# Adaptive with elastic net
+
+# Convert to vector and drop intercept
+initial_coefs <- as.vector(coef_enet)[-1]
+
+# Indices of variables selected by Elastic Net
+non_zero_idx <- which(initial_coefs != 0)
+
+# Subset the design matrix to include only selected variables
+X_train_selected <- X_train[, non_zero_idx, drop = FALSE]
+X_test_selected  <- X_test[, non_zero_idx, drop = FALSE]
+
+# Adaptive weights: inverse of absolute values of non-zero Elastic Net coefs
+adaptive_weights <- 1 / abs(initial_coefs[non_zero_idx])
+
+```
+
+```{r}
+#fit the model
+cv_adaptive_enet <- cv.glmnet(
+  X_train_selected, y_train,
+  family = "binomial",
+  alpha = 1,
+  type.measure = "auc",
+  penalty.factor = adaptive_weights,
+  nfolds = 10
+)
+lambda_adapt_enet <- cv_adaptive_enet$lambda.min
+
+```
+
+```{r}
+# Extract coefficients from adaptive model
+coef_adapt_enet <- coef(cv_adaptive_enet, s = lambda_adapt_enet)
+
+# Convert to data frame
+coef_df_adapt_enet <- as.data.frame(as.matrix(coef_adapt_enet))
+colnames(coef_df_adapt_enet)[1] <- "value"
+coef_df_adapt_enet$Variable <- rownames(coef_df_adapt_enet)
+
+# Keep only non-zero coefficients (excluding intercept)
+coef_adapt_enet_non_zero <- subset(coef_df_adapt_enet, value != 0 & Variable != "(Intercept)")
+
+# Show count and values
+cat("Adaptive Lasso (from Elastic Net) selected", nrow(coef_adapt_enet_non_zero), "variables with non-zero coefficients.\n\n")
+print(coef_adapt_enet_non_zero)
+
+```
+
+
+```{r}
+#make predictions
+fitted_probs_adapt_enet <- as.vector(predict(
+  cv_adaptive_enet,
+  newx = X_test_selected,
+  s = lambda_adapt_enet,
+  type = "response"
+))
+
+```
+
+```{r}
+#roc curve
+roc_adapt_enet <- roc(y_test, fitted_probs_adapt_enet, positive = "1", quiet = TRUE)
+plot(roc_adapt_enet, legacy.axes = TRUE, print.thres = TRUE, print.thres.col = "darkgreen",
+     main = "ROC - Adaptive Lasso (from Elastic Net)")
+cat("AUC:", round(auc(roc_adapt_enet), 3), "\n")
+
+```
+
+
+```{r}
+# 1. Automatically select the best threshold from ROC curve
+threshold_adapt_enet <- coords(roc_adapt_enet, "best", ret = "threshold")[[1]]
+cat("Automatically selected threshold:", round(threshold_adapt_enet, 4), "\n")
+
+# 2. Predict classes using the selected threshold
+pred_adapt_enet <- ifelse(fitted_probs_adapt_enet >= threshold_adapt_enet, 1, 0)
+
+# 3. Confusion matrix
+conf_matrix_adapt_enet <- table(Predicted = pred_adapt_enet, Actual = y_test)
+cat("\nConfusion Matrix:\n")
+print(conf_matrix_adapt_enet)
+
+# 4. Row-wise proportions
+cat("\nRow-wise proportions:\n")
+print(round(prop.table(conf_matrix_adapt_enet, 1), 3))
+
+# 5. Compute metrics
+TP <- sum(pred_adapt_enet == 1 & y_test == 1)
+TN <- sum(pred_adapt_enet == 0 & y_test == 0)
+FP <- sum(pred_adapt_enet == 1 & y_test == 0)
+FN <- sum(pred_adapt_enet == 0 & y_test == 1)
+
+precision   <- ifelse((TP + FP) > 0, TP / (TP + FP), NA)
+recall      <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
+specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA)
+f1_score    <- ifelse((precision + recall) > 0, 2 * precision * recall / (precision + recall), NA)
+accuracy    <- mean(pred_adapt_enet == y_test)
+
+# 6. Print results
+cat("\nPerformance metrics:\n")
+cat("Accuracy   :", round(accuracy, 3), "\n")
+cat("Precision  :", round(precision, 3), "\n")
+cat("Recall     :", round(recall, 3), "\n")
+cat("Specificity:", round(specificity, 3), "\n")
+cat("F1-score   :", round(f1_score, 3), "\n")
+
+```
+
+
+``` {r}
+
+summarize_model_performance <- function(name, y_true, y_pred, y_prob, auc_obj, coef_df) {
+  TP <- sum(y_pred == 1 & y_true == 1)
+  TN <- sum(y_pred == 0 & y_true == 0)
+  FP <- sum(y_pred == 1 & y_true == 0)
+  FN <- sum(y_pred == 0 & y_true == 1)
+  
+  precision   <- ifelse((TP + FP) > 0, TP / (TP + FP), NA)
+  recall      <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
+  specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA)
+  f1_score    <- ifelse((precision + recall) > 0, 2 * precision * recall / (precision + recall), NA)
+  accuracy    <- mean(y_pred == y_true)
+  auc_value   <- auc(auc_obj)
+  
+  # Count non-zero coefficients (excluding intercept)
+  n_covariates <- sum(coef_df$value != 0 & coef_df$Variable != "(Intercept)")
+  
+  return(data.frame(
+    Model = name,
+    Accuracy = round(accuracy, 3),
+    Precision = round(precision, 3),
+    Recall = round(recall, 3),
+    Specificity = round(specificity, 3),
+    F1 = round(f1_score, 3),
+    AUC = round(auc_value, 3),
+    Covariates = n_covariates
+  ))
+}
+
+```
+
+``` {r}
+
+perf_lasso        <- summarize_model_performance("Lasso", y_test, pred_class_lasso, fitted_probs_test, roc_lasso, coef_df)
+perf_adapt        <- summarize_model_performance("Adaptive Lasso", y_test, pred_adapt, fitted_probs_adapt, roc_adapt, coef_df_adapt)
+perf_enet         <- summarize_model_performance("Elastic Net", y_test, pred_enet, fitted_probs_enet, roc_enet, coef_df_enet)
+perf_adapt_enet   <- summarize_model_performance("Adaptive from EN", y_test, pred_adapt_enet, fitted_probs_adapt_enet, roc_adapt_enet, coef_df_adapt_enet)
+
+all_performance <- rbind(perf_lasso, perf_adapt, perf_enet, perf_adapt_enet)
+print(all_performance)
+
+```
+
+
+``` {r}
+
+# Identify model with highest AUC
+best_model_idx <- which.max(all_performance$AUC)
+best_model_name <- all_performance$Model[best_model_idx]
+cat("\nBest model based on AUC:", best_model_name, "\n")
+
+# Select the corresponding coefficient data frame
+best_coef_df <- switch(
+  best_model_name,
+  "Lasso"            = coef_df_non_zero,
+  "Adaptive Lasso"   = coef_df_adapt_non_zero,
+  "Elastic Net"      = coef_df_enet_non_zero,
+  "Adaptive from EN" = coef_adapt_enet_non_zero
+)
+
+setwd("~/Desktop/BSE/Term 3/Thesis/master_thesis_git/liver cancer")
+
+# Save to CSV
+write.csv(best_coef_df, file = paste0("OS_best_model_coefficients_", gsub(" ", "_", best_model_name), ".csv"), row.names = FALSE)
+
+```
+
+
+#RIDGE REGRESSION
+
+```{r}
+#RIDGE REGRESSION
+
+
+# Fit Ridge regression with 10-fold cross-validation
+set.seed(236)
+cv_ridge <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 0, 
+                      type.measure = "auc", nfolds = 10, nlambda = 200)
+
+# Optimal lambda
+lambda_ridge <- cv_ridge$lambda.min
+cat("Optimal Lambda (alpha=0):", lambda_ridge, "\n")
+
+
+```
+
+```{r}
+# Get non-zero coefficients for Ridge regression
+coef_ridge <- coef(cv_ridge, s = lambda_ridge)
+coef_df_ridge <- as.data.frame(as.matrix(coef_ridge))
+colnames(coef_df_ridge)[1] <- "value"
+coef_df_ridge$Variable <- rownames(coef_df_ridge)
+
+# Display non-zero coefficients (excluding intercept)
+coef_df_ridge_non_zero <- subset(coef_df_ridge, value != 0 & Variable != "(Intercept)")
+print(coef_df_ridge_non_zero)
+
+# Predict probabilities on the test set
+fitted_probs_test <- as.vector(predict(cv_ridge, newx = X_test, s = lambda_ridge, type = "response"))
+
+# ROC curve and AUC (on test set)
+roc_ridge <- roc(y_test, fitted_probs_test, positive = "1", quiet = TRUE)
+plot(roc_ridge, legacy.axes = TRUE, print.thres = TRUE, 
+     print.thres.col = "darkgreen", main = "ROC - Ridge (Test Set)")
+
+cat("Ridge Test AUC:", round(auc(roc_ridge), 3), "\n")
+
+```
+
+```{r}
+setwd("C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/liverselected")
+
+# Save to CSV in the current working directory
+write.csv(coef_df_ridge_non_zero, file = "OS_coefficients_Ridge.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+# --- ADAPTIVE RIDGE REGRESSION ---
+
+# Use Ridge non-zero coefficients (excluding intercept) as starting point
+initial_coefs <- coef_df_ridge_non_zero$value
+non_zero_vars <- coef_df_ridge_non_zero$Variable
+
+# Select only the variables with non-zero Ridge coefficients
+X_train_selected <- X_train[, non_zero_vars, drop = FALSE]
+X_test_selected  <- X_test[, non_zero_vars, drop = FALSE]
+
+# Define adaptive weights (inverse of absolute Ridge coefficients)
+adaptive_weights <- 1 / abs(initial_coefs)
+
+# Fit Adaptive Ridge using adaptive weights
+set.seed(236)
+cv_adaptive_ridge <- cv.glmnet(
+  X_train_selected, y_train,
+  family = "binomial",
+  alpha = 0,
+  type.measure = "auc",
+  penalty.factor = adaptive_weights,
+  nfolds = 10
+)
+
+# Optimal lambda for Adaptive Ridge
+lambda_adapt <- cv_adaptive_ridge$lambda.min
+cat("Optimal Lambda (Adaptive Ridge):", lambda_adapt, "\n")
+
+# Get non-zero Adaptive Ridge coefficients
+coef_adapt <- coef(cv_adaptive_ridge, s = lambda_adapt)
+coef_df_adapt <- as.data.frame(as.matrix(coef_adapt))
+colnames(coef_df_adapt)[1] <- "value"
+coef_df_adapt$Variable <- rownames(coef_df_adapt)
+
+# Filter non-zero coefficients (excluding intercept)
+coef_df_adapt_non_zero <- subset(coef_df_adapt, value != 0 & Variable != "(Intercept)")
+cat("Adaptive Ridge selected", nrow(coef_df_adapt_non_zero), "genes.\n")
+print(coef_df_adapt_non_zero)
+
+# Predict probabilities on the test set
+fitted_probs_adapt <- as.vector(predict(cv_adaptive_ridge, newx = X_test_selected, s = lambda_adapt, type = "response"))
+
+# ROC curve and AUC for Adaptive Ridge
+roc_adapt <- roc(y_test, fitted_probs_adapt, positive = "1", quiet = TRUE)
+plot(roc_adapt, legacy.axes = TRUE, print.auc = TRUE, print.auc.col = "blue", 
+     main = "ROC - Adaptive Ridge (Test Set)")
+
+cat("Adaptive Ridge Test AUC:", round(auc(roc_adapt), 3), "\n")
+
+# Save Adaptive Ridge coefficients to CSV
+write.csv(
+  coef_df_adapt_non_zero,
+  file = "OS_coefficients_AdaptiveRidge.csv",
+  row.names = FALSE
+)
+
+```
+

@@ -1,0 +1,207 @@
+---
+title: "Bayesian Variable Selection vs. Penalized Logistic Regression"
+author: "Tirdod Behbehani, Elisa Scocco, Iñigo Exposito"
+date: "2025-05-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(readr)
+library(varbvs)
+library(pROC)
+library(glmnet)
+library(caret)
+set.seed(123)  # Global seed
+```
+
+## 1. Load and Preprocess Gene Expression Data
+
+```{r load-data}
+gene_expression <- read_csv("~/Downloads/gene_expression_stage_34.csv") %>%
+  select(-Is_stage_34, -id)
+
+y <- as.numeric(gene_expression$OS)
+X <- scale(gene_expression %>% select(-OS)) %>% as.matrix()
+predictor_names <- colnames(X)
+n <- nrow(X)
+```
+
+``` {r}
+
+selected_genes <- read_csv("~/Downloads/OS_coefficients_Elastic_Net.csv")
+
+```
+
+## 2. Train/Test Split
+
+```{r split}
+set.seed(123)
+train_idx <- sample(seq_len(n), size = floor(0.8 * n))
+X_train <- X[train_idx, ]
+y_train <- y[train_idx]
+X_test  <- X[-train_idx, ]
+y_test  <- y[-train_idx]
+```
+
+## 3. Feature Screening - All Genes or Selected Genes (Use All Genes (No Feature Screening))
+
+```{r screening}
+# Xtr_scr <- X_train
+# Xte_scr <- X_test
+# top_k <- seq_len(ncol(X_train))  # track all genes
+# k <- length(top_k)
+
+# Extract character vector of selected gene names
+selected_gene_names <- as.character(selected_genes$Variable)
+
+# Desired total number of genes
+k <- 5000
+
+# Calculate variance across training samples
+vars_train <- apply(X_train, 2, var)
+
+# Identify remaining genes (exclude selected ones)
+remaining_genes <- setdiff(colnames(X_train), selected_gene_names)
+
+# Select top (k - length(selected)) high-variance genes from remaining
+top_remaining <- order(vars_train[remaining_genes], decreasing = TRUE)
+top_k_remaining <- remaining_genes[top_remaining][1:(k - length(selected_gene_names))]
+
+# Combine selected and top-variance genes
+final_genes <- c(selected_gene_names, top_k_remaining)
+
+# Sanity check
+stopifnot(length(final_genes) == k)
+
+# Subset training and test matrices
+Xtr_scr <- X_train[, final_genes]
+Xte_scr <- X_test[, final_genes]
+
+```
+
+## 4. Penalized Logistic Models
+
+```{r penalties}
+set.seed(123)
+Xtr <- as.matrix(Xtr_scr)
+Xte <- as.matrix(Xte_scr)
+ytr <- as.numeric(y_train)
+
+# # (A) Ridge Regression
+# ridge <- cv.glmnet(Xtr, ytr, alpha = 0, family = "binomial", lambda = 10^seq(-4, 1, length.out = 100))
+# preds_ridge <- predict(ridge, Xte, s = ridge$lambda.min, type = "response")
+# 
+# # (B) LASSO
+# lasso <- cv.glmnet(Xtr, ytr, alpha = 1, family = "binomial", lambda = 10^seq(-4, 1, length.out = 100))
+# preds_lasso <- predict(lasso, Xte, s = lasso$lambda.min, type = "response")
+# 
+# # (C) Elastic Net
+# enet <- cv.glmnet(Xtr, ytr, alpha = 0.5, family = "binomial", lambda = 10^seq(-4, 1, length.out = 100))
+# preds_enet <- predict(enet, Xte, s = enet$lambda.min, type = "response")
+```
+
+## 5. Bayesian Model with varbvs (Two-Step Prior)
+
+```{r bayesian}
+set.seed(123)
+
+cat("Starting Step 1: Fitting Bayesian model with uniform prior...\n")
+
+# Step 1: Uniform prior (0.5 for all genes)
+pi0 <- 0.5
+logodds0 <- rep(log(pi0 / (1 - pi0)), k)
+
+start_time <- Sys.time()
+fit1 <- varbvs(X = Xtr, Z = NULL, y = ytr, family = "binomial", logodds = logodds0)
+end_time <- Sys.time()
+cat("Step 1 complete. Duration:", round(difftime(end_time, start_time, units = "mins"), 2), "minutes.\n")
+
+pips1 <- fit1$pip
+
+cat("Calculating priors for Step 2 based on Step 1 results...\n")
+
+# Step 2: Define promising genes from Elastic Net
+promising_genes <- as.character(selected_genes$Variable)
+is_promising <- colnames(Xtr) %in% promising_genes
+
+# Compute new priors: avg1 for promising, avg0 for others
+avg1 <- mean(pips1[is_promising])
+avg0 <- mean(pips1[!is_promising])
+
+cat(sprintf("Prior mean for promising genes (avg1): %.4f\n", avg1))
+cat(sprintf("Prior mean for other genes (avg0): %.4f\n", avg0))
+
+pi2 <- ifelse(is_promising, avg1, avg0)
+logodds2 <- log(pi2 / (1 - pi2))
+
+cat("Starting Step 2: Fitting Bayesian model with informed prior...\n")
+start_time2 <- Sys.time()
+fit_bayes <- varbvs(X = Xtr, Z = NULL, y = ytr, family = "binomial", logodds = logodds2)
+end_time2 <- Sys.time()
+cat("Step 2 complete. Duration:", round(difftime(end_time2, start_time2, units = "mins"), 2), "minutes.\n")
+
+preds_bayes <- predict(fit_bayes, X = Xte)
+
+# Posterior means of coefficients
+avg_beta <- fit_bayes$alpha * fit_bayes$mu
+
+# Get selected variables
+selected_idx <- which(fit_bayes$pip > 0.5)
+selected_genes_final <- colnames(Xtr)[selected_idx]
+selected_pips <- fit_bayes$pip[selected_idx]
+selected_betas <- avg_beta[selected_idx]
+
+# Assemble result table
+bayes_results <- data.frame(
+  Gene = selected_genes_final,
+  PIP = selected_pips,
+  Coefficient = selected_betas
+) %>% arrange(desc(PIP))
+
+# Output results
+cat("Bayesian Model (Two-Step Prior): Selected variables with PIP > 0.5\n")
+print(bayes_results)
+```
+
+## 6. ROC and AUC Comparisons
+
+```{r auc}
+models <- list(
+  #Ridge = preds_ridge,
+  #LASSO = preds_lasso,
+  #ElasticNet = preds_enet,
+  Bayesian = preds_bayes
+)
+
+# Step 1 predictions
+preds_step1 <- predict(fit1, X = Xte)
+
+# Step 1 AUC
+roc_step1 <- roc(y_test, preds_step1)
+auc_step1 <- auc(roc_step1)
+cat(sprintf("AUC Step 1 (Uniform Prior): %.4f\n", auc_step1))
+
+# Step 2 AUC (you already have this)
+roc_step2 <- roc(y_test, preds_bayes)
+auc_step2 <- auc(roc_step2)
+cat(sprintf("AUC Step 2 (Informed Prior): %.4f\n", auc_step2))
+
+for (m in names(models)) {
+  r <- roc(y_test, models[[m]])
+  cat(sprintf("AUC %s: %.4f\n", m, auc(r)))
+}
+```
+
+validation as that AUC is suspiciously high
+``` {r}
+
+# Plot ROC for Step 1 and Step 2
+plot(roc_step1, col = "blue", lwd = 2, main = "ROC Curve: Step 1 vs Step 2")
+lines(roc_step2, col = "red", lwd = 2)
+legend("bottomright",
+       legend = c("Step 1: Uniform Prior", "Step 2: Informed Prior"),
+       col = c("blue", "red"),
+       lwd = 2)
+
+```

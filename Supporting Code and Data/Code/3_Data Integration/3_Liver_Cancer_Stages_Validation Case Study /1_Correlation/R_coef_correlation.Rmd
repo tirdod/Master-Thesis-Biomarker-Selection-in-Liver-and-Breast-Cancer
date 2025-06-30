@@ -1,0 +1,277 @@
+---
+title: "Lasso - Liver"
+author: "Tirdod Behbehani, Elisa Scocco,Iñigo Exposito"
+date: "2025-04-19"
+output: html_document
+---
+```{r}
+#load packages
+library(readr)
+library(glmnet)
+library(pROC)
+library(caret)
+library(dplyr)
+library(tools)
+
+```
+
+```{r}
+# Define paths
+stage_12_folder <- "C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/stages/coef_stage12"
+stage_34_folder <- "C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/stages/coef_stage34"
+
+# Define base filenames per model type
+base_filenames <- c(
+  "coefficients_Lasso.csv",
+  "coefficients_Adaptive_Lasso.csv",
+  "coefficients_Elastic_Net.csv",
+  "coefficients_Adaptive_from_EN.csv",
+  "coefficients_Ridge.csv",
+  "coefficients_Adaptive_Ridge.csv"
+)
+
+# Define outcomes (if more than OS, add here)
+outcomes <- c("OS")
+
+# Create results storage
+results <- data.frame(
+  Outcome = character(),
+  Stage_12_Model = character(),
+  Stage_34_Model = character(),
+  Common_Variables = integer(),
+  Common_Gene_Names = character(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through outcomes
+for (outcome in outcomes) {
+  for (stage12_file_suffix in base_filenames) {
+    stage12_file <- file.path(stage_12_folder, paste0(outcome, "_", stage12_file_suffix))
+    
+    if (!file.exists(stage12_file)) {
+      cat("⚠ Missing Stage 12 file:", stage12_file, "\n")
+      next
+    }
+    
+    # Read Stage 12 data
+    stage12_df <- read_csv(stage12_file, show_col_types = FALSE)
+    if (!"Variable" %in% colnames(stage12_df)) colnames(stage12_df) <- c("value", "Variable")
+    
+    for (stage34_file_suffix in base_filenames) {
+      stage34_file <- file.path(stage_34_folder, paste0(outcome, "_", stage34_file_suffix))
+      
+      if (!file.exists(stage34_file)) {
+        cat("⚠ Missing Stage 34 file:", stage34_file, "\n")
+        next
+      }
+      
+      # Read Stage 34 data
+      stage34_df <- read_csv(stage34_file, show_col_types = FALSE)
+      if (!"Variable" %in% colnames(stage34_df)) colnames(stage34_df) <- c("Variable", "value")
+      
+      # Get intersection of gene names
+      common_vars <- intersect(stage12_df$Variable, stage34_df$Variable)
+      common_var_str <- paste(common_vars, collapse = "; ")  # for nice CSV output
+      
+      # Append to results table
+      results <- rbind(results, data.frame(
+        Outcome = outcome,
+        Stage_12_Model = stage12_file_suffix,
+        Stage_34_Model = stage34_file_suffix,
+        Common_Variables = length(common_vars),
+        Common_Gene_Names = common_var_str,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+}
+
+# View result table
+print(results)
+
+
+```
+
+
+```{r}
+setwd("C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/stages")
+
+
+write.csv(results, "crosscheck_liver12_liver34_overlap_with_genes.csv", row.names = FALSE)
+```
+
+## now we do the correlation of variables selected from liver and liver on the best models
+
+```{r}
+# Loop through outcomes
+for (outcome in outcomes) {
+  for (stage34_file_suffix in base_filenames) {
+    stage34_file <- file.path(stage_34_folder, paste0(outcome, "_", stage34_file_suffix))
+    if (!file.exists(stage34_file)) {
+      cat("⚠ Missing Stage 34 file:", stage34_file, "\n")
+      next
+    }
+    
+    stage34_df <- read_csv(stage34_file, show_col_types = FALSE)
+    if (!"Variable" %in% colnames(stage34_df)) colnames(stage34_df) <- c("value", "Variable")
+    stage34_df <- stage34_df %>% select(Variable, Stage34_beta = value)
+    
+    for (stage12_file_suffix in base_filenames) {
+      stage12_file <- file.path(stage_12_folder, paste0(outcome, "_", stage12_file_suffix))
+      if (!file.exists(stage12_file)) {
+        cat("⚠ Missing Stage 12 file:", stage12_file, "\n")
+        next
+      }
+      
+      stage12_df <- read_csv(stage12_file, show_col_types = FALSE)
+      if (!"Variable" %in% colnames(stage12_df)) colnames(stage12_df) <- c("Variable", "value")
+      stage12_df <- stage12_df %>% select(Variable, Stage12_beta = value)
+      
+      # Full join to align genes and fill missing with 0
+      combined_df <- full_join(stage34_df, stage12_df, by = "Variable") %>%
+        mutate(
+          Stage34_beta = ifelse(is.na(Stage34_beta), 0, Stage34_beta),
+          Stage12_beta = ifelse(is.na(Stage12_beta), 0, Stage12_beta)
+        )
+      
+      # Plot
+      p <- ggplot(combined_df, aes(x = Stage12_beta, y = Stage34_beta)) +
+        geom_point(alpha = 0.7) +
+        labs(
+          title = paste("Outcome:", outcome, "\nStage 34:", stage34_file_suffix, "| Stage 12:", stage12_file_suffix),
+          x = expression(hat(beta)["Stage_12"]),
+          y = expression(hat(beta)["Stage_34"])
+        ) +
+        theme_minimal()
+      
+      print(p)
+      
+      # Save plot
+      output_folder <- "C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/stages/imgs/scatterplots"
+
+      plot_filename <- paste0("scatter_", outcome, "_Stage34_", tools::file_path_sans_ext(stage34_file_suffix), 
+                              "_Stage12_", tools::file_path_sans_ext(stage12_file_suffix), ".png")
+      plot_path <- file.path(output_folder, plot_filename)
+      ggsave(plot_path, plot = p, width = 7, height = 6, dpi = 300)
+    }
+  }
+}
+
+
+```
+
+
+```{r}
+output_folder <- "C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/stages/imgs/boxplots"
+
+# Loop through outcomes
+for (outcome in outcomes) {
+  for (stage34_file_suffix in base_filenames) {
+    stage34_file <- file.path(stage_34_folder, paste0(outcome, "_", stage34_file_suffix))
+    if (!file.exists(stage34_file)) {
+      cat("⚠ Missing Stage 34 file:", stage34_file, "\n")
+      next
+    }
+
+    stage34_df <- read_csv(stage34_file, show_col_types = FALSE)
+    if (!"Variable" %in% colnames(stage34_df)) colnames(stage34_df) <- c("value", "Variable")
+    stage34_df <- stage34_df %>% select(Variable, Stage34_beta = value)
+
+    for (stage12_file_suffix in base_filenames) {
+      stage12_file <- file.path(stage_12_folder, paste0(outcome, "_", stage12_file_suffix))
+      if (!file.exists(stage12_file)) {
+        cat("⚠ Missing Stage 12 file:", stage12_file, "\n")
+        next
+      }
+
+      stage12_df <- read_csv(stage12_file, show_col_types = FALSE)
+      if (!"Variable" %in% colnames(stage12_df)) colnames(stage12_df) <- c("Variable", "value")
+      stage12_df <- stage12_df %>% select(Variable, Stage12_beta = value)
+
+      # Full join to align genes and fill missing with 0
+      combined_df <- full_join(stage34_df, stage12_df, by = "Variable") %>%
+        mutate(
+          Stage34_beta = ifelse(is.na(Stage34_beta), 0, Stage34_beta),
+          Stage12_beta = ifelse(is.na(Stage12_beta), 0, Stage12_beta)
+        )
+
+      # Scatter plot (Stage12 on x-axis now)
+      scatter_title <- paste("Outcome:", outcome, "\nStage 34:", stage34_file_suffix, "| Stage 12:", stage12_file_suffix)
+      p <- ggplot(combined_df, aes(x = Stage12_beta, y = Stage34_beta)) +
+        geom_point(alpha = 0.7) +
+        labs(
+          title = scatter_title,
+          x = expression(hat(beta)["stage_12"]),
+          y = expression(hat(beta)["stage_34"])
+        ) +
+        theme_minimal()
+
+      scatter_filename <- paste0("scatter_", outcome, "_Stage34_", file_path_sans_ext(stage34_file_suffix), 
+                                 "_Stage12_", file_path_sans_ext(stage12_file_suffix), ".png")
+      scatter_path <- file.path(output_folder, scatter_filename)
+      ggsave(scatter_path, plot = p, width = 7, height = 6, dpi = 300)
+
+      # Discretize x-axis (Stage12_beta now binned)
+      is_ridge <- grepl("Ridge", stage12_file_suffix, ignore.case = TRUE)
+      if (is_ridge) {
+        combined_df <- combined_df %>%
+          mutate(Binned_Stage12 = cut(Stage12_beta, breaks = 10))
+      } else {
+        combined_df <- combined_df %>%
+          mutate(Binned_Stage12 = case_when(
+            Stage12_beta < 0 ~ "< 0",
+            Stage12_beta > 0 ~ "> 0",
+            TRUE ~ "= 0"
+          ))
+      }
+
+      # Boxplot of Stage34 beta coefficients binned by Stage12 betas
+      boxplot_title <- paste("Boxplot of Stage 34 Beta by Stage 12 Beta Bins\nOutcome:", outcome,
+                             "\nStage 34:", stage34_file_suffix, "| Stage 12:", stage12_file_suffix)
+
+      box_p <- ggplot(combined_df, aes(x = Binned_Stage12, y = Stage34_beta)) +
+        geom_boxplot() +
+        labs(
+          title = boxplot_title,
+          x = "Binned Stage 12 Coefficients",
+          y = expression(hat(beta)["stage_34"])
+        ) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+      print(box_p)
+
+      # Save the boxplot
+      boxplot_filename <- paste0("boxplot_", outcome, "_Stage34_", file_path_sans_ext(stage34_file_suffix), 
+                                 "_Stage12_", file_path_sans_ext(stage12_file_suffix), ".png")
+      boxplot_path <- file.path(output_folder, boxplot_filename)
+      ggsave(boxplot_path, plot = box_p, width = 7, height = 6, dpi = 300)
+    }
+  }
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

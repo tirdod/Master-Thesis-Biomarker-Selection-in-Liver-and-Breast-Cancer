@@ -1,0 +1,257 @@
+---
+title: "Lasso - Liver"
+author: "Tirdod Behbehani, Elisa Scocco,Iñigo Exposito"
+date: "2025-04-19"
+output: html_document
+---
+
+
+```{r}
+#––– PACKAGES –––
+library(readr)
+library(glmnet)
+library(pROC)
+library(caret)
+library(ParBayesianOptimization)
+library(dplyr)
+```
+
+first we try the liver --> OS (incorporating breast coefficients)
+```{r}
+#––– 0) LOAD + PREP DATA –––
+#gene_expression_liver <- read_csv("/Users/inigo/Downloads/gene_expression_only_liver_final.csv") %>%
+#  select(-Is_stage_34, -id)
+
+#––– 0) LOAD + PREP DATA –––
+gene_expression_liver <- read_csv(
+    "~/Desktop/BSE/Term 3/Thesis/liver cancer/gene_expression_only_liver_final.csv",
+    show_col_types = FALSE
+  ) %>% 
+  select(-Is_stage_34, -id)
+
+y <- gene_expression_liver$OS
+X <- scale(gene_expression_liver %>% select(-OS)) %>% as.matrix()
+
+p <- ncol(X)
+predictor_names <- colnames(X)
+
+#––– 0a) READ PRIOR ADAPTIVE‐RIDGE COEFFICIENTS –––
+coef_ridge <- read_csv(
+    "~/Downloads/Breast_OS_coefficients_adaptive_Ridge.csv",
+    show_col_types = FALSE
+  ) %>%
+  mutate(abs_value = abs(value))
+```
+
+``` {r}
+
+# Step 2: Compute threshold at 25th percentile
+cutoff <- quantile(coef_ridge$abs_value, 0.25)
+
+# Step 3: Create binary z_j indicator: 1 if in top 75%, 0 otherwise
+coef_ridge <- coef_ridge %>%
+  mutate(z_j = as.integer(abs_value > cutoff))
+
+# Step 4: Initialize z_j vector for all predictors
+z_j <- integer(p)
+names(z_j) <- predictor_names
+
+# Step 5: Assign z_j values for predictors found in coef_ridge
+matched <- match(coef_ridge$Variable, predictor_names)
+z_j[matched[!is.na(matched)]] <- coef_ridge$z_j[!is.na(matched)]
+
+```
+
+``` {r}
+
+compute_bic <- function(eta0, eta1, X, y, z_j) {
+  n <- nrow(X)
+
+  # 1) compute lambda_j using binary z_j
+  lambda_j <- exp(eta0 + eta1 * z_j)
+
+  # 2) scale design matrix by lambda_j
+  W <- sweep(X, 2, lambda_j, FUN = "/")
+
+  # 3) fit ridge regression with fixed lambda = 1
+  fit <- glmnet(
+    x           = W,
+    y           = y,
+    family      = "binomial",
+    alpha       = 0,
+    lambda      = 1,
+    intercept   = TRUE,
+    standardize = FALSE
+  )
+
+  coefs      <- as.numeric(coef(fit, s = 1))
+  intercept  <- coefs[1]
+  beta_tilde <- coefs[-1]
+  beta_j     <- beta_tilde / lambda_j
+
+  # 4) compute log-likelihood
+  linpred <- intercept + X %*% beta_j
+  p_hat   <- pmin(pmax(1 / (1 + exp(-linpred)), 1e-8), 1 - 1e-8)
+  ll      <- sum(y * log(p_hat) + (1 - y) * log(1 - p_hat))
+
+  # 5) compute BIC
+  df_beta <- ncol(X)
+  df_eta  <- 1 + as.integer(eta1 != 0)
+  df_tot  <- df_beta + df_eta
+  bic_val <- -2 * ll + df_tot * log(n)
+
+  if (!is.finite(bic_val)) bic_val <- 1e10
+
+  return(bic_val)
+}
+
+```
+
+``` {r}
+#––– GRID SEARCH over eta0, eta1 –––
+eta0_grid <- seq(-10, -2, by = 0.25)   # baseline penalty
+eta1_grid <- seq(-2,  2, by = 0.25)   # penalty adjustment for z_j
+
+# build all combinations
+grid <- expand.grid(eta0 = eta0_grid, eta1 = eta1_grid)
+
+# evaluate BIC at each point using z_j
+grid$bic <- mapply(
+  compute_bic,
+  eta0     = grid$eta0,
+  eta1     = grid$eta1,
+  MoreArgs = list(X = X, y = y, z_j = z_j)
+)
+
+# find the best hyperparameter combination
+best_idx <- which.min(grid$bic)
+best     <- grid[best_idx, ]
+
+cat(sprintf(
+  "→ Best BIC: η₀ = %.3f, η₁ = %.3f, BIC = %.1f\n",
+  best$eta0, best$eta1, best$bic
+))
+```
+
+second we try the liver --> Stage (including breast coefficients)
+```{r}
+#––– 0) LOAD + PREP DATA –––
+#gene_expression_liver <- read_csv("/Users/inigo/Downloads/gene_expression_only_liver_final.csv") %>%
+#  select(-Is_stage_34, -id)
+
+#––– 0) LOAD + PREP DATA –––
+gene_expression_liver <- read_csv(
+    "~/Desktop/BSE/Term 3/Thesis/liver cancer/gene_expression_only_liver_final.csv",
+    show_col_types = FALSE
+  ) %>% 
+  select(-OS, -id)
+
+y <- gene_expression_liver$Is_stage_34
+X <- scale(gene_expression_liver %>% select(-Is_stage_34)) %>% as.matrix()
+
+p <- ncol(X)
+predictor_names <- colnames(X)
+
+#––– 0a) READ PRIOR ADAPTIVE‐RIDGE COEFFICIENTS –––
+coef_ridge <- read_csv(
+    "~/Downloads/Breast_isstage_coefficients_adaptive_Ridge.csv",
+    show_col_types = FALSE
+  ) %>%
+  mutate(abs_value = abs(value))
+```
+
+``` {r}
+
+# Step 2: Compute threshold at 25th percentile
+cutoff <- quantile(coef_ridge$abs_value, 0.25)
+
+# Step 3: Create binary z_j indicator: 1 if in top 75%, 0 otherwise
+coef_ridge <- coef_ridge %>%
+  mutate(z_j = as.integer(abs_value > cutoff))
+
+# Step 4: Initialize z_j vector for all predictors
+z_j <- integer(p)
+names(z_j) <- predictor_names
+
+# Step 5: Assign z_j values for predictors found in coef_ridge
+matched <- match(coef_ridge$Variable, predictor_names)
+z_j[matched[!is.na(matched)]] <- coef_ridge$z_j[!is.na(matched)]
+
+```
+
+``` {r}
+
+compute_bic <- function(eta0, eta1, X, y, z_j) {
+  n <- nrow(X)
+
+  # 1) compute lambda_j using binary z_j
+  lambda_j <- exp(eta0 + eta1 * z_j)
+
+  # 2) scale design matrix by lambda_j
+  W <- sweep(X, 2, lambda_j, FUN = "/")
+
+  # 3) fit ridge regression with fixed lambda = 1
+  fit <- glmnet(
+    x           = W,
+    y           = y,
+    family      = "binomial",
+    alpha       = 0,
+    lambda      = 1,
+    intercept   = TRUE,
+    standardize = FALSE
+  )
+
+  coefs      <- as.numeric(coef(fit, s = 1))
+  intercept  <- coefs[1]
+  beta_tilde <- coefs[-1]
+  beta_j     <- beta_tilde / lambda_j
+
+  # 4) compute log-likelihood
+  linpred <- intercept + X %*% beta_j
+  p_hat   <- pmin(pmax(1 / (1 + exp(-linpred)), 1e-8), 1 - 1e-8)
+  ll      <- sum(y * log(p_hat) + (1 - y) * log(1 - p_hat))
+
+  # 5) compute BIC
+  df_beta <- ncol(X)
+  df_eta  <- 1 + as.integer(eta1 != 0)
+  df_tot  <- df_beta + df_eta
+  bic_val <- -2 * ll + df_tot * log(n)
+
+  if (!is.finite(bic_val)) bic_val <- 1e10
+
+  return(bic_val)
+}
+
+```
+
+``` {r}
+#––– GRID SEARCH over eta0, eta1 –––
+eta0_grid <- seq(-10, -2, by = 0.25)   # baseline penalty
+eta1_grid <- seq(-2,  2, by = 0.25)   # penalty adjustment for z_j
+
+# build all combinations
+grid <- expand.grid(eta0 = eta0_grid, eta1 = eta1_grid)
+
+# evaluate BIC at each point using z_j
+grid$bic <- mapply(
+  compute_bic,
+  eta0     = grid$eta0,
+  eta1     = grid$eta1,
+  MoreArgs = list(X = X, y = y, z_j = z_j)
+)
+
+# find the best hyperparameter combination
+best_idx <- which.min(grid$bic)
+best     <- grid[best_idx, ]
+
+cat(sprintf(
+  "→ Best BIC: η₀ = %.3f, η₁ = %.3f, BIC = %.1f\n",
+  best$eta0, best$eta1, best$bic
+))
+```
+
+
+
+
+
+

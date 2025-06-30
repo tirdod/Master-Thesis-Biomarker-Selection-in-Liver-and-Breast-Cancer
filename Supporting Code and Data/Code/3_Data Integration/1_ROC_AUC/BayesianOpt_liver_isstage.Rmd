@@ -1,0 +1,186 @@
+---
+title: "Lasso - Liver"
+author: "Tirdod Behbehani, Elisa Scocco,Iñigo Exposito"
+date: "2025-04-19"
+output: html_document
+---
+
+
+```{r}
+#––– PACKAGES –––
+library(readr)
+library(glmnet)
+library(pROC)
+library(caret)
+library(ParBayesianOptimization)
+library(dplyr)
+```
+
+
+```{r}
+#––– 0) LOAD + PREP DATA –––
+gene_expression_liver <- read_csv("/Users/inigo/Downloads/gene_expression_only_liver_final (1).csv") %>%
+  select(-OS, -id)
+
+y <- gene_expression_liver$Is_stage_34
+X <- scale(gene_expression_liver %>% select(-Is_stage_34)) %>% as.matrix()
+n <- nrow(X);  p <- ncol(X)
+predictor_names <- colnames(X)
+
+coef_enet <- read_csv("/Users/inigo/Downloads/isstage_coefficients_adaptive_Ridge.csv") %>%
+  mutate(selected = as.integer(value != 0)) %>%
+  select(Variable, selected)
+```
+
+```{r}
+coef_enet <- read_csv("/Users/inigo/Downloads/isstage_coefficients_adaptive_Ridge.csv") %>%
+  # Calcular el valor absoluto de los coeficientes
+  mutate(abs_value = abs(value)) %>%
+  # Calcular el umbral para eliminar el 25% más pequeños
+  arrange(abs_value) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank > floor(0.25 * n())) %>%
+  # Marcar los seleccionados
+  mutate(selected = as.integer(value != 0)) %>%
+  select(Variable, selected)
+```
+
+
+```{r}
+z_j <- integer(p); names(z_j) <- predictor_names
+z_j[ intersect(predictor_names, coef_enet$Variable) ] <-
+  coef_enet$selected[ match(intersect(predictor_names, coef_enet$Variable),
+                            coef_enet$Variable) ]
+```
+
+
+```{r}
+#––– 1) Pre‐define CV folds once –––
+set.seed(123)
+k     <- 10
+folds <- sample(rep(1:k, length.out = n))
+```
+
+
+```{r}
+#––– 2) Objective: 3‐step integrative LASSO + CV‐AUC –––
+lasso_cv_auc <- function(theta0, theta1) {
+  lambda_j <- exp(theta0 + theta1 * z_j)
+  W        <- sweep(X, 2, lambda_j, FUN = "/")
+  
+  aucs <- numeric(k)
+  for (i in seq_len(k)) {
+    tr   <- which(folds != i); te  <- which(folds == i)
+    W_tr <- W[tr, , drop=FALSE];  y_tr <- y[tr]
+    W_te <- W[te, , drop=FALSE];  y_te <- y[te]
+    
+    fit        <- glmnet(x = W_tr, y = y_tr,
+                         family="binomial",
+                         alpha=1, lambda=1,
+                         intercept=TRUE,
+                         standardize=FALSE)
+    coefs      <- as.numeric(coef(fit, s = 1))
+    intercept  <- coefs[1]
+    beta_tilde <- coefs[-1]
+    
+    # coercion to numeric vector here:
+    linpred_vec <- as.numeric(intercept + W_te %*% beta_tilde)
+    prob_te     <- 1/(1 + exp(-linpred_vec))
+    
+    aucs[i]     <- auc(roc(y_te, prob_te, quiet = TRUE))
+  }
+  
+  list(Score = mean(aucs), Pred = mean(aucs))
+}
+```
+
+
+```{r}
+#––– 3) Bayesian Optimization over (θ₀,θ₁) –––
+set.seed(456)
+opt_auc <- bayesOpt(
+  FUN        = lasso_cv_auc,
+  bounds     = list(
+    theta0 = c(-5, 5),    
+    theta1 = c(-1, 1)     
+  ),
+  initPoints = 50,
+  iters.n    = 100,
+  acq        = "ucb",
+  kappa      = 2.576,
+  verbose    = 1
+)
+
+best_par   <- getBestPars(opt_auc)
+theta0_opt <- best_par$theta0
+theta1_opt <- best_par$theta1
+auc_cv_opt <- opt_auc$scoreSummary$Pred[ which.max(opt_auc$scoreSummary$Value) ]
+
+cat("θ0* =", round(theta0_opt,4),
+    " θ1* =", round(theta1_opt,4),
+    " CV-AUC* =", round(auc_cv_opt,4), "\n\n")
+```
+
+
+```{r}
+#––– 4) Final train/test split + AUC on test –––
+set.seed(42)
+train_idx <- createDataPartition(y, p = 0.8, list = FALSE)
+X_tr      <- X[train_idx, , drop=FALSE]
+y_tr      <- y[train_idx]
+X_te      <- X[-train_idx, , drop=FALSE]
+y_te      <- y[-train_idx]
+
+# recompute penalties & Ws
+lambda_j_opt <- exp(theta0_opt + theta1_opt * z_j)
+W_tr         <- sweep(X_tr, 2, lambda_j_opt, FUN = "/")
+W_te         <- sweep(X_te,  2, lambda_j_opt, FUN = "/")
+
+# fit integrative LASSO on train
+fit_final <- glmnet(
+  x           = W_tr,
+  y           = y_tr,
+  family      = "binomial",
+  alpha       = 1,
+  lambda      = 1,
+  intercept   = TRUE,
+  standardize = FALSE
+)
+coefs      <- as.numeric(coef(fit_final, s = 1))
+intercept  <- coefs[1]
+beta_tilde <- coefs[-1]
+
+# predict & AUC on test
+linpred    <- intercept + W_te %*% beta_tilde
+prob_te    <- 1/(1 + exp(-linpred))
+roc_te     <- roc(y_te, prob_te, quiet = TRUE)
+auc_test   <- auc(roc_te)
+
+cat("AUC on test set:", round(auc_test,4), "\n")
+plot(roc_te, main = sprintf("ROC Test (AUC = %.3f)", auc_test))
+```
+
+
+```{r}
+#––– 5) final non-zero coefficients –––
+beta_final <- beta_tilde / lambda_j_opt
+nz         <- which(abs(beta_final) > 0)
+
+cat("Selected variables:", length(nz), "\n")
+df_sel <- data.frame(
+  Predictor  = predictor_names[nz],
+  Beta       = round(beta_final[nz],6),
+  Lambda_j   = round(lambda_j_opt[nz],6),
+  Common     = z_j[nz]
+)
+print(df_sel)
+
+```
+
+```{r}
+table(df_sel$Common)
+
+```
+
+
+

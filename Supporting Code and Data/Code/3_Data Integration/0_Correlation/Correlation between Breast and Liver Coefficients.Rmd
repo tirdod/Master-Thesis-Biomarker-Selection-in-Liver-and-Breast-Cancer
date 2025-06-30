@@ -1,0 +1,281 @@
+---
+title: "Lasso - Liver"
+author: "Tirdod Behbehani, Elisa Scocco,Iñigo Exposito"
+date: "2025-04-19"
+output: html_document
+---
+```{r}
+#load packages
+library(readr)
+library(glmnet)
+library(pROC)
+library(caret)
+library(dplyr)
+library(tools)
+
+```
+
+```{r}
+# Define paths
+breast_folder <- "C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/breastselected"
+liver_folder  <- "C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/liverselected"
+
+# Define base filenames per group
+base_filenames <- c(
+  "coefficients_Lasso.csv",
+  "coefficients_Adaptive_Lasso.csv",
+  "coefficients_Elastic_Net.csv",
+  "coefficients_Adaptive_from_EN.csv",
+  "coefficients_Ridge.csv",
+  "coefficients_adaptive_Ridge.csv"
+)
+
+# Define outcomes
+outcomes <- c("OS", "isstage", "combined")
+
+# Create results storage
+results <- data.frame(
+  Outcome = character(),
+  Liver_Model = character(),
+  Breast_Model = character(),
+  Common_Variables = integer(),
+  Common_Gene_Names = character(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through outcomes
+for (outcome in outcomes) {
+  for (liver_file_suffix in base_filenames) {
+    liver_file <- file.path(liver_folder, paste0(outcome, "_", liver_file_suffix))
+    
+    if (!file.exists(liver_file)) {
+      cat("⚠ Missing liver file:", liver_file, "\n")
+      next
+    }
+    
+    # Read liver data
+    liver_df <- read_csv(liver_file, show_col_types = FALSE)
+    if (!"Variable" %in% colnames(liver_df)) colnames(liver_df) <- c("value", "Variable")
+    
+    for (breast_file_suffix in base_filenames) {
+      breast_file <- file.path(breast_folder, paste0(outcome, "_", breast_file_suffix))
+      
+      if (!file.exists(breast_file)) {
+        cat("⚠ Missing breast file:", breast_file, "\n")
+        next
+      }
+      
+      # Read breast data
+      breast_df <- read_csv(breast_file, show_col_types = FALSE)
+      if (!"Variable" %in% colnames(breast_df)) colnames(breast_df) <- c("Variable", "value")
+      
+      # Get intersection
+      common_vars <- intersect(liver_df$Variable, breast_df$Variable)
+      common_var_str <- paste(common_vars, collapse = "; ")  # join with semicolon for CSV compatibility
+      
+      # Save result
+      results <- rbind(results, data.frame(
+        Outcome = outcome,
+        Liver_Model = liver_file_suffix,
+        Breast_Model = breast_file_suffix,
+        Common_Variables = length(common_vars),
+        Common_Gene_Names = common_var_str,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+}
+# View result table
+print(results)
+
+
+```
+
+
+```{r}
+setwd("C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files")
+
+
+write.csv(results, "crosscheck_breast_liver_overlap_with_genes.csv", row.names = FALSE)
+```
+
+## now we do the correlation of variables selected from liver and breast on the best models
+
+```{r}
+# Loop through outcomes
+for (outcome in outcomes) {
+  for (liver_file_suffix in base_filenames) {
+    liver_file <- file.path(liver_folder, paste0(outcome, "_", liver_file_suffix))
+    if (!file.exists(liver_file)) {
+      cat("⚠ Missing liver file:", liver_file, "\n")
+      next
+    }
+    
+    liver_df <- read_csv(liver_file, show_col_types = FALSE)
+    if (!"Variable" %in% colnames(liver_df)) colnames(liver_df) <- c("value", "Variable")
+    liver_df <- liver_df %>% select(Variable, Liver_beta = value)
+    
+    for (breast_file_suffix in base_filenames) {
+      breast_file <- file.path(breast_folder, paste0(outcome, "_", breast_file_suffix))
+      if (!file.exists(breast_file)) {
+        cat("⚠ Missing breast file:", breast_file, "\n")
+        next
+      }
+      
+      breast_df <- read_csv(breast_file, show_col_types = FALSE)
+      if (!"Variable" %in% colnames(breast_df)) colnames(breast_df) <- c("Variable", "value")
+      breast_df <- breast_df %>% select(Variable, Breast_beta = value)
+      
+      # Full join to align genes and fill missing with 0
+      combined_df <- full_join(liver_df, breast_df, by = "Variable") %>%
+        mutate(
+          Liver_beta = ifelse(is.na(Liver_beta), 0, Liver_beta),
+          Breast_beta = ifelse(is.na(Breast_beta), 0, Breast_beta)
+        )
+      
+      # Plot
+      p <- ggplot(combined_df, aes(x = Breast_beta, y = Liver_beta)) +
+        geom_point(alpha = 0.7) +
+        labs(
+          title = paste("Outcome:", outcome, "\nLiver:", liver_file_suffix, "| Breast:", breast_file_suffix),
+          x = expression(hat(beta)["breast"]),
+          y = expression(hat(beta)["liver"])
+        ) +
+        theme_minimal()
+      
+      print(p)
+      
+      # Generate plot
+      p <- ggplot(combined_df, aes(x = Breast_beta, y = Liver_beta)) +
+        geom_point(alpha = 0.7) +
+        labs(
+          title = paste("Outcome:", outcome, "\nLiver:", liver_file_suffix, "| Breast:", breast_file_suffix),
+          x = expression(hat(beta)["breast"]),
+          y = expression(hat(beta)["liver"])
+        ) +
+        theme_minimal()
+      
+      # Save plot
+      
+      output_folder <- "C:/Users/usuario/OneDrive/Desktop/Thesis/personal_files/imgs/scatterplots"
+
+      plot_filename <- paste0("scatter_", outcome, "_Liver_", tools::file_path_sans_ext(liver_file_suffix), 
+                              "_Breast_", tools::file_path_sans_ext(breast_file_suffix), ".png")
+      plot_path <- file.path(output_folder, plot_filename)
+      ggsave(plot_path, plot = p, width = 7, height = 6, dpi = 300)
+    }
+  }
+}
+```
+
+
+```{r}
+# Loop through outcomes
+for (outcome in outcomes) {
+  for (liver_file_suffix in base_filenames) {
+    liver_file <- file.path(liver_folder, paste0(outcome, "_", liver_file_suffix))
+    if (!file.exists(liver_file)) {
+      cat("⚠ Missing liver file:", liver_file, "\n")
+      next
+    }
+
+    liver_df <- read_csv(liver_file, show_col_types = FALSE)
+    if (!"Variable" %in% colnames(liver_df)) colnames(liver_df) <- c("value", "Variable")
+    liver_df <- liver_df %>% select(Variable, Liver_beta = value)
+
+    for (breast_file_suffix in base_filenames) {
+      breast_file <- file.path(breast_folder, paste0(outcome, "_", breast_file_suffix))
+      if (!file.exists(breast_file)) {
+        cat("⚠ Missing breast file:", breast_file, "\n")
+        next
+      }
+
+      breast_df <- read_csv(breast_file, show_col_types = FALSE)
+      if (!"Variable" %in% colnames(breast_df)) colnames(breast_df) <- c("Variable", "value")
+      breast_df <- breast_df %>% select(Variable, Breast_beta = value)
+
+      # Full join to align genes and fill missing with 0
+      combined_df <- full_join(liver_df, breast_df, by = "Variable") %>%
+        mutate(
+          Liver_beta = ifelse(is.na(Liver_beta), 0, Liver_beta),
+          Breast_beta = ifelse(is.na(Breast_beta), 0, Breast_beta)
+        )
+
+      # Scatter plot
+      scatter_title <- paste("Outcome:", outcome, "\nLiver:", liver_file_suffix, "| Breast:", breast_file_suffix)
+      p <- ggplot(combined_df, aes(x = Breast_beta, y = Liver_beta)) +
+        geom_point(alpha = 0.7) +
+        labs(
+          title = scatter_title,
+          x = expression(hat(beta)["breast"]),
+          y = expression(hat(beta)["liver"])
+        ) +
+        theme_minimal()
+
+      scatter_filename <- paste0("scatter_", outcome, "_Liver_", file_path_sans_ext(liver_file_suffix), 
+                                 "_Breast_", file_path_sans_ext(breast_file_suffix), ".png")
+      scatter_path <- file.path(output_folder, scatter_filename)
+      ggsave(scatter_path, plot = p, width = 7, height = 6, dpi = 300)
+
+      # Discretize x-axis (Breast_beta)
+      is_ridge <- grepl("Ridge", breast_file_suffix, ignore.case = TRUE)
+      if (is_ridge) {
+        combined_df <- combined_df %>%
+          mutate(Binned_Breast = cut(Breast_beta, breaks = 10))
+      } else {
+        combined_df <- combined_df %>%
+          mutate(Binned_Breast = case_when(
+            Breast_beta < 0 ~ "< 0",
+            Breast_beta > 0 ~ "> 0",
+            TRUE ~ "= 0"
+          ))
+      }
+
+      # Boxplot
+      boxplot_title <- paste("Boxplot of Liver Beta by Breast Beta Bins\nOutcome:", outcome,
+                             "\nLiver:", liver_file_suffix, "| Breast:", breast_file_suffix)
+
+      box_p <- ggplot(combined_df, aes(x = Binned_Breast, y = Liver_beta)) +
+        geom_boxplot() +
+        labs(
+          title = boxplot_title,
+          x = "Binned Breast Coefficients",
+          y = expression(hat(beta)["liver"])
+        ) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+      print(box_p)
+
+      # Save the boxplot
+      boxplot_filename <- paste0("boxplot_", outcome, "_Liver_", file_path_sans_ext(liver_file_suffix), 
+                                 "_Breast_", file_path_sans_ext(breast_file_suffix), ".png")
+      boxplot_path <- file.path(output_folder, boxplot_filename)
+      ggsave(boxplot_path, plot = box_p, width = 7, height = 6, dpi = 300)
+    }
+  }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
